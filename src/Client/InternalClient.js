@@ -52,14 +52,15 @@ export default class InternalClient {
 	}
 
 	apiRequest(method, url, useAuth, data, file) {
-		if(this.retryAfters[url]) {
-			if(this.retryAfters[url] < Date.now()) {
-				delete this.retryAfters[url];
+        var endpoint = url.replace(/\/[0-9]+/g, "/:id");
+		if(this.retryAfters[endpoint]) {
+			if(this.retryAfters[endpoint] < Date.now()) {
+				delete this.retryAfters[endpoint];
 			} else {
 				return new Promise((resolve, reject) => {
 					setTimeout(() => {
 						this.apiRequest.apply(this, arguments).then(resolve).catch(reject);
-					}, this.retryAfters[url] - Date.now());
+					}, this.retryAfters[endpoint] - Date.now());
 				});
 			}
 		}
@@ -67,11 +68,17 @@ export default class InternalClient {
 		if (useAuth) {
 			ret.set("authorization", this.token);
 		}
-		if (data) {
-			ret.send(data);
-		}
 		if (file) {
 			ret.attach("file", file.file, file.name);
+			if (data) {
+				for (var i in data) {
+					if (data[i] !== undefined) {
+						ret.field(i, data[i]);
+					}
+				}
+			}
+		} else if (data) {
+			ret.send(data);
 		}
 		ret.set('User-Agent', this.userAgentInfo.full);
 		return new Promise((resolve, reject) => {
@@ -86,11 +93,11 @@ export default class InternalClient {
 
 						if (data.headers["retry-after"] || data.headers["Retry-After"]) {
 							var toWait = data.headers["retry-after"] || data.headers["Retry-After"];
-							if(!this.retryAfters[url])
-								this.retryAfters[url] = Date.now() + parseInt(toWait);
+							if(!this.retryAfters[endpoint])
+								this.retryAfters[endpoint] = Date.now() + parseInt(toWait);
 							setTimeout(() => {
 								this.apiRequest.apply(this, arguments).then(resolve).catch(reject);
-							}, this.retryAfters[url] - Date.now());
+							}, this.retryAfters[endpoint] - Date.now());
 						} else {
 							return reject(error);
 						}
@@ -122,12 +129,14 @@ export default class InternalClient {
 		// creates 4 caches with discriminators based on ID
 		this.users = new Cache();
 		this.friends = new Cache();
+		this.blocked_users = new Cache();
 		this.outgoing_friend_requests = new Cache();
 		this.incoming_friend_requests = new Cache();
 		this.channels = new Cache();
 		this.servers = new Cache();
 		this.unavailableServers = new Cache();
 		this.private_channels = new Cache();
+		this.autoReconnectInterval = 1000;
 
 		this.intervals = {
 			typing : [],
@@ -153,7 +162,7 @@ export default class InternalClient {
 		}
 	}
 
-	disconnected(forced = false) {
+	disconnected(autoReconnect = false) {
 
 		this.cleanIntervals();
 
@@ -161,15 +170,18 @@ export default class InternalClient {
 			this.leaveVoiceChannel(vc);
 		});
 
-		if (this.client.options.revive && !forced) {
-			this.setup();
+		if (autoReconnect) {
+			this.autoReconnectInterval = Math.min(this.autoReconnectInterval * (Math.random() + 1), 60000);
+			setTimeout(() => {
+				this.setup();
 
-			// Check whether the email is set (if not, only a token has been used for login)
-			if (this.email) {
-				this.login(this.email, this.password);
-			} else {
-				this.loginWithToken(this.token);
-			}
+				// Check whether the email is set (if not, only a token has been used for login)
+				if (this.email) {
+					this.login(this.email, this.password);
+				} else {
+					this.loginWithToken(this.token);
+				}
+			}, this.autoReconnectInterval);
 		}
 
 		this.client.emit("disconnected");
@@ -401,13 +413,45 @@ export default class InternalClient {
 	}
 
 	//def updateServer
-	updateServer(server, name, region) {
+	updateServer(server, options) {
 		var server = this.resolver.resolveServer(server);
 		if (!server) {
 			return Promise.reject(new Error("server did not resolve"));
 		}
 
-		return this.apiRequest("patch", Endpoints.SERVER(server.id), true, { name: name || server.name, region: region || server.region })
+		var newOptions = {
+			name: options.name || server.name,
+			region: options.region || server.region
+		};
+
+		if (options.icon) {
+			newOptions.icon = this.resolver.resolveToBase64(options.icon);
+		}
+		if (options.splash) {
+			newOptions.splash = this.resolver.resolveToBase64(options.splash);
+		}
+		if (options.owner) {
+			var user = this.resolver.resolveUser(options.owner);
+			if (!user) {
+				return Promise.reject(new Error("owner could not be resolved"));
+			}
+			options.owner_id = user.id;
+		}
+		if (options.verificationLevel) {
+			options.verification_level = user.verificationLevel;
+		}
+		if (options.afkChannel) {
+			var channel = this.resolver.resolveUser(options.afkChannel);
+			if (!channel) {
+				return Promise.reject(new Error("afkChannel could not be resolved"));
+			}
+			options.afk_channel_id = channel.id;
+		}
+		if (options.afkTimeout) {
+			options.afk_timeout = user.afkTimeout;
+		}
+
+		return this.apiRequest("patch", Endpoints.SERVER(server.id), true, options)
 		.then(res => {
 			// wait until the name and region are updated
 			return waitFor(() =>
@@ -504,6 +548,7 @@ export default class InternalClient {
 			throw error;
 		})
 		.catch(error => {
+			this.websocket = null;
 			this.state = ConnectionState.DISCONNECTED;
 			client.emit("disconnected");
 			throw error;
@@ -552,22 +597,81 @@ export default class InternalClient {
 
 	// def sendMessage
 	sendMessage(where, _content, options = {}) {
+		if (options.file) {
+			if (typeof options.file !== "object") {
+				options.file = {
+					file: options.file
+				};
+			}
+			if (!options.file.name) {
+				if (options.file.file instanceof String || typeof options.file.file === "string") {
+					options.file.name = require("path").basename(options.file.file);
+				} else if (options.file.file.path) {
+					// fs.createReadStream()'s have .path that give the path. Not sure about other streams though.
+					options.file.name = require("path").basename(options.file.file.path);
+				} else {
+					options.file.name = "default.png"; // Just have to go with default filenames.
+				}
+			}
+		}
 
 		return this.resolver.resolveChannel(where)
 		.then(destination => {
-			//var destination;
-			var content = this.resolver.resolveString(_content);
+			if (options.file) {
+				return this.resolver.resolveFile(options.file.file)
+				.then(file =>
+					this.apiRequest("post", Endpoints.CHANNEL_MESSAGES(destination.id), true, {
+						content: _content,
+						tts: options.tts
+					}, {
+						name: options.file.name,
+						file: file
+					}).then(res => destination.messages.add(new Message(res, destination, this.client)))
+				)
+			} else {
+				var content = this.resolver.resolveString(_content);
 
-			return this.apiRequest("post", Endpoints.CHANNEL_MESSAGES(destination.id), true, {
-				content: content,
-				tts: options.tts
-			})
-			.then(res =>
-				destination.messages.add(new Message(res, destination, this.client))
-			);
+				return this.apiRequest("post", Endpoints.CHANNEL_MESSAGES(destination.id), true, {
+					content: content,
+					tts: options.tts
+				})
+				.then(res => destination.messages.add(new Message(res, destination, this.client)));
+			}
 		});
 
 	}
+
+	// def sendFile
+	sendFile(where, _file, name, content) {
+		if (!name) {
+			if (_file instanceof String || typeof _file === "string") {
+				name = require("path").basename(_file);
+			} else if (_file && _file.path) {
+				// fs.createReadStream()'s have .path that give the path. Not sure about other streams though.
+				name = require("path").basename(_file.path);
+			} else {
+				name = "default.png"; // Just have to go with default filenames.
+			}
+		}
+
+		if(content) {
+			content = {
+				content
+			};
+		}
+
+		return this.resolver.resolveChannel(where)
+		.then(channel =>
+			this.resolver.resolveFile(_file)
+			.then(file =>
+				this.apiRequest("post", Endpoints.CHANNEL_MESSAGES(channel.id), true, content, {
+					name,
+					file
+				}).then(res => channel.messages.add(new Message(res, channel, this.client)))
+			)
+		);
+	}
+
 	// def deleteMessage
 	deleteMessage(_message, options = {}) {
 
@@ -607,31 +711,6 @@ export default class InternalClient {
 			message,
 			new Message(res, message.channel, this.client)
 		));
-	}
-
-	// def sendFile
-	sendFile(where, _file, name) {
-		if (!name) {
-			if (_file instanceof String || typeof _file === "string") {
-				name = require("path").basename(_file);
-			} else if (_file.path) {
-				// fs.createReadStream()'s have .path that give the path. Not sure about other streams though.
-				name = require("path").basename(_file.path);
-			} else {
-				name = "default.png"; // Just have to go with default filenames.
-			}
-		}
-
-		return this.resolver.resolveChannel(where)
-		.then(channel =>
-			this.resolver.resolveFile(_file)
-			.then(file =>
-				this.apiRequest("post", Endpoints.CHANNEL_MESSAGES(channel.id), true, null, {
-					name,
-					file
-				}).then(res => channel.messages.add(new Message(res, channel, this.client)))
-			)
-		);
 	}
 
 	// def getChannelLogs
@@ -1143,8 +1222,9 @@ export default class InternalClient {
 
 	//def updateDetails
 	updateDetails(data) {
-		if (!this.user.bot && !(this.email || data.email))
+		if (!this.user.bot && !(this.email || data.email)) {
 			throw new Error("Must provide email since a token was used to login");
+		}
 
 		var options = {
 			avatar: this.resolver.resolveToBase64(data.avatar) || this.user.avatar,
@@ -1306,14 +1386,17 @@ export default class InternalClient {
 			});
 		};
 
-		this.websocket.onclose = () => {
+		this.websocket.onclose = (code) => {
 			self.websocket = null;
 			self.state = ConnectionState.DISCONNECTED;
-			self.disconnected();
+			self.disconnected(this.client.options.autoReconnect);
 		};
 
 		this.websocket.onerror = e => {
 			client.emit("error", e);
+			self.websocket = null;
+			self.state = ConnectionState.DISCONNECTED;
+			self.disconnected(this.client.options.autoReconnect);
 		};
 
 		this.websocket.onmessage = e => {
@@ -1343,6 +1426,7 @@ export default class InternalClient {
 					this.forceFetchCount = {};
 					this.forceFetchQueue = [];
 					this.forceFetchLength = 1;
+					this.autoReconnectInterval = 1000;
 
 					data.guilds.forEach(server => {
 						if (!server.unavailable) {
@@ -1351,7 +1435,7 @@ export default class InternalClient {
 								self.getGuildMembers(server.id, Math.ceil(server.memberCount / 1000));
 							}
 						} else {
-							client.emit("warn", "server " + server.id + " was unavailable, could not create (ready)");
+							client.emit("debug", "server " + server.id + " was unavailable, could not create (ready)");
 							self.unavailableServers.add(server);
 						}
 					});
@@ -1362,6 +1446,8 @@ export default class InternalClient {
 						data.relationships.forEach(friend => {
 							if (friend.type === 1) { // is a friend
 								self.friends.add(new User(friend.user, client));
+							} else if (friend.type === 2) { // incoming friend requests
+								self.blocked_users.add(new User(friend.user, client));
 							} else if (friend.type === 3) { // incoming friend requests
 								self.incoming_friend_requests.add(new User(friend.user, client));
 							} else if (friend.type === 4) { // outgoing friend requests
@@ -1372,6 +1458,7 @@ export default class InternalClient {
 						});
 					} else {
 						self.friends = null;
+						self.blocked_users = null;
 						self.incoming_friend_requests = null;
 						self.outgoing_friend_requests = null;
 					}
@@ -1410,7 +1497,7 @@ export default class InternalClient {
 						if (msg) {
 							channel.messages.remove(msg);
 						} else {
-							client.emit("warn", "message was deleted but message is not cached");
+							client.emit("debug", "message was deleted but message is not cached");
 						}
 					} else {
 						client.emit("warn", "message was deleted but channel is not cached");
@@ -1459,7 +1546,7 @@ export default class InternalClient {
 							}
 							self.restartServerCreateTimeout();
 						} else {
-							client.emit("warn", "server was unavailable, could not create");
+							client.emit("debug", "server was unavailable, could not create");
 						}
 					}
 					break;
@@ -1488,7 +1575,7 @@ export default class InternalClient {
 								}
 							}
 						} else {
-							client.emit("warn", "server was unavailable, could not update");
+							client.emit("debug", "server was unavailable, could not update");
 						}
 					} else {
 						client.emit("warn", "server was deleted but it was not in the cache");
@@ -1822,7 +1909,7 @@ export default class InternalClient {
 						client.emit("warn", "voice state update but user or server not in cache");
 					}
 
-					if (user.id === self.user.id) { // only for detecting self user movements for connections.
+					if (user && user.id === self.user.id) { // only for detecting self user movements for connections.
 						var connection = self.voiceConnections.get("server", server);
 						// existing connection, perhaps channel moved
 						if (connection && connection.voiceChannel.id !== data.channel_id) {
@@ -1885,6 +1972,9 @@ export default class InternalClient {
 							client.emit("friendRequestAccepted", outUser);
 							return;
 						}
+					} else if (data.type === 2) {
+						// client received block
+						self.blocked_users.add(new User(data.user, client));
 					} else if (data.type === 3) {
 						// client received friend request
 						client.emit("friendRequestReceived", self.incoming_friend_requests.add(new User(data.user, client)));
@@ -1898,6 +1988,12 @@ export default class InternalClient {
 					if (user) {
 						self.friends.remove(user);
 						client.emit("friendRemoved", user);
+						return;
+					}
+
+					user = self.blocked_users.get("id", data.id);
+					if (user) { // they rejected friend request
+						self.blocked_users.remove(user);
 						return;
 					}
 

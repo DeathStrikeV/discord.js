@@ -364,6 +364,11 @@ export default class Client extends EventEmitter {
 			callback = options;
 			options = {};
 		}
+		if (typeof content === "object" && content.file) {
+			// content has file
+			options = content;
+			content = "";
+		}
 
 		return this.internal.sendMessage(destination, content, options)
 			.then(dataCallback(callback), errorCallback(callback));
@@ -631,14 +636,19 @@ export default class Client extends EventEmitter {
 	 *     .then(msg => console.log("sent file!"))
 	 *     .catch(err => console.log("couldn't send file!"));
 	 */
-	sendFile(destination, attachment, name, callback = (/*err, m*/) => { }) {
+	sendFile(destination, attachment, name, content, callback = (/*err, m*/) => { }) {
+		if (typeof content === "function") {
+			// content is the callback
+			callback = content;
+			content = undefined; // Will get resolved into original filename in internal
+		}
 		if (typeof name === "function") {
 			// name is the callback
 			callback = name;
 			name = undefined; // Will get resolved into original filename in internal
 		}
 
-		return this.internal.sendFile(destination, attachment, name)
+		return this.internal.sendFile(destination, attachment, name, content)
 			.then(dataCallback(callback), errorCallback(callback));
 	}
 
@@ -701,14 +711,19 @@ export default class Client extends EventEmitter {
 	}
 
 	// def updateServer
-	updateServer(server, name, region, callback = (/*err, srv*/) => { }) {
+	updateServer(server, options, region, callback = (/*err, srv*/) => { }) {
 		if (typeof region === "function") {
 			// region is the callback
 			callback = region;
 			region = undefined;
+		} else if (region && typeof options === "string") {
+			options = {
+				name: options,
+				region: region
+			};
 		}
 
-		return this.internal.updateServer(server, name, region)
+		return this.internal.updateServer(server, options)
 			.then(dataCallback(callback), errorCallback(callback));
 	}
 
